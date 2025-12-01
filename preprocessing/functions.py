@@ -2,6 +2,7 @@ import numpy as np
 from functools import partial
 from sage.all import Zmod, PolynomialRing, ZZ
 from multiprocessing import Pool, cpu_count
+from preprocessing.monte_carlo_C_m import unique_prime_factors
 
 
 ################################################################
@@ -9,52 +10,64 @@ from multiprocessing import Pool, cpu_count
 ################################################################
 
 def parameters_worker(m, p, k, s):
-    # IMPORTANTE: las importaciones deben hacerse dentro del worker para evitar
-    # problemas de pickling al usar multiprocessing con Sage.
-    from sage.all import Zmod, PolynomialRing, cyclotomic_polynomial, gcd, euler_phi
+    from sage.all import euler_phi, gcd, Zmod, cyclotomic_polynomial, PolynomialRing
 
-    # Queremos m tal que gcd(m, p) = 1 para que la teoría ciclotómica estándar funcione.
-    # Cuando (p, m) = 1, la reducción de Φ_m modulo p factoriza en grados que dividen
-    # el orden multiplicativo de p mod m — esto es clave para controlar los grados k'.
+    # 1. Filtro rápido de GCD
     if gcd(m, p) != 1:
         return None
 
-    # Cota de seguridad que se usa en el paper
+    # 2. Filtro rápido de phi(m)
+    # Calculamos phi primero porque es barato y descarta muchos candidatos
     phi_m = int(euler_phi(m))
     if phi_m < 14300:
         return None
 
-    # Construimos el polinomio ciclotómico Φ_m en ℤ[x].
+    # 3. EL GRAN CAMBIO: Calcular el orden multiplicativo
+    # Esto reemplaza a la factorización polinómica. Es O(log m) vs O(poly_degree).
+    try:
+        Zn = Zmod(m)
+        d = int(Zn(p).multiplicative_order())
+    except ArithmeticError:
+        return None
+
+    # 4. Verificaciones aritméticas (sin polinomios aún)
+    
+    # Condición A: El grado d debe contener a la extensión k (d debe ser múltiplo de k)
+    if d % k != 0:
+        return None
+        
+    # Condición B: Debe haber suficientes slots
+    # El número de factores es phi(m) / d
+    num_slots = phi_m // d
+    if num_slots < s:
+        return None
+
+    # factors = unique_prime_factors(m)
+    # if len(factors) == 1:
+    #     C_m = 4/np.pi
+    # elif np.prod(factors) <= 600:
+    #     C_m = 8.6
+    # else:
+    #     return None
+
+    # --- SI LLEGAMOS AQUÍ, EL M ES CORRECTO ---
+    # Recién ahora gastamos recursos en construir el objeto pesado para devolverlo.
+    
     Phi_ZZ = cyclotomic_polynomial(m)
-
-    # Pasamos a R = 𝔽_p[x].
     R = PolynomialRing(Zmod(p), 'x')
-
-    # Reducimos Φ_m mod p (coerción a R).
     Phi = R(Phi_ZZ)
-
-    # Factorizamos Φ_m en 𝔽_p[x]; matemáticamente buscamos su descomposición en factores
-    # irreducibles para obtener sus grados k'_i.
+    
+    # Ni siquiera necesitamos factorizar 'Phi' realmente para devolver la info,
+    # porque ya sabemos que hay 'num_slots' factores de grado 'd'.
+    # Pero si tu código posterior necesita los factores explícitos serializados:
     fac = Phi.factor()
+    
+    # Reconstruimos outputs para compatibilidad con tu código original
+    coeffs = [int(c) for c in Phi.list()]
+    fac_serial = [(str(f), int(e)) for (f, e) in fac]
+    degrees = [d] * num_slots # Todos tienen el mismo grado d
 
-    # Construimos la lista de grados (teniendo en cuenta exponentes).
-    # Esto produce los grados k'_i de los cuerpos finitos 𝔽_{p^{k'_i}}
-    # que aparecen en la descomposición A ≅ ∏ 𝔽_{p^{k'_i}}.
-    degrees = [f.degree() for (f, e) in fac for _ in range(e)]
-
-    # Buscamos factores cuyo grado sea múltiplo de k, porque sólo así
-    # 𝔽_{p^{k'_i}} contendrá una subextensión isomorfa a 𝔽_{p^k}.
-    good_degs = [d for d in degrees if d % k == 0]
-
-    # Si hay al menos s tales factores, entonces Φ_m satisface la condición para alojar
-    # M = (𝔽_{p^k})^s dentro de A.
-    if len(good_degs) >= s:
-        # Para enviar datos entre procesos guardamos sólo objetos serializables.
-        coeffs = [int(c) for c in Phi.list()]  # coeficientes de Φ_m mod p
-        fac_serial = [(str(f), int(e)) for (f, e) in fac]
-        return (m, coeffs, fac_serial, degrees, phi_m)
-
-    return None
+    return (m, coeffs, fac_serial, degrees, phi_m)
 
 def calculate_m(p, k, s, min_m, max_m):
     # Preconfiguramos el worker para que reciba sólo m
@@ -106,46 +119,6 @@ def generate_Aq(q, coeffs):
     
     return Aq
 
-################################################################
-#                         Others                               #
-################################################################
-
-def unique_prime_factors(n):
-    """
-    Calcula el conjunto de factores primos únicos de un número entero n.
-    Ejemplo: 8 -> {2}, 12 -> {2, 3}, 7 -> {7}
-    """
-    if n <= 1:
-        return set()
-
-    factores = set()
-    d = 2
-
-    # Paso 1: Manejar el factor 2 (el único factor primo par)
-    if n % d == 0:
-        factores.add(d)
-        while n % d == 0:
-            n //= d
-
-    # Paso 2: Manejar factores primos impares
-    # Solo necesitamos verificar hasta la raíz cuadrada del número restante (n)
-    d = 3
-    limite = int(np.sqrt(n))
-    while d <= limite:
-        if n % d == 0:
-            factores.add(d)
-            while n % d == 0:
-                n //= d
-            # Recalcular el límite de la raíz cuadrada para el nuevo n reducido
-            limite = int(np.sqrt(n))
-        d += 2 # Saltar al siguiente impar (3, 5, 7, 9...)
-
-    # Paso 3: Manejar el caso donde n es un primo grande
-    # Si al final n es mayor que 1, el n restante es el último factor primo.
-    if n > 1:
-        factores.add(n)
-
-    return factores
 
 ################################################################
 #                    D_{\rho}^d  distribution                  #
