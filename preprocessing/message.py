@@ -1,4 +1,6 @@
-from sage.all import GF, PolynomialRing, ZZ
+import gmpy2
+import multiprocessing
+from sage.all import GF, PolynomialRing, ZZ, CRT
 
 
 # -----------------------------
@@ -34,38 +36,74 @@ def poly_crt(residues, moduli, R_p):
 # -----------------------------
 # Encode (robusto)
 # -----------------------------
-def encode(messages, R_p, moduli, Aq):
+def center_worker(coeffs_chunk, p):
+    """
+    Función ejecutada por cada núcleo para centrar una porción de coeficientes.
+    """
+    centered_coeffs = []
+    limit = p // 2
+    p_int = int(p)
+    
+    for c in coeffs_chunk:
+        val = int(c)
+        if val > limit:
+            centered_coeffs.append(val - p_int)
+        else:
+            centered_coeffs.append(val)
+    return centered_coeffs
+
+# -----------------------------
+# Encode (PARALELIZADO y CORREGIDO)
+# -----------------------------
+def encode(messages, R_p, moduli, Aq, use_parallel=True):
     p = R_p.characteristic()
     if len(messages) > len(moduli):
         raise ValueError("Demasiados mensajes para el número de slots")
 
-    # Convertir mensajes a residuos en R_p
+    # 1. Preparación de residuos (Sequential)
     poly_msgs = [R_p(m) for m in messages]
     while len(poly_msgs) < len(moduli):
         poly_msgs.append(R_p(0))
 
-    # CRT polinomial robusto
-    plaintext_poly_mod_p = poly_crt(poly_msgs, moduli, R_p)
+    # 2. CRT Polinomial (Usando la implementación nativa y optimizada de Sage)
+    # ESTE ES EL PASO MÁS LENTO Y NO DEBE SER PARALELIZADO MANUALMENTE.
+    plaintext_poly_mod_p = CRT(poly_msgs, moduli)
 
-    # Centrado exacto en (-p/2, ..., p/2]
+    # 3. Centrado exacto en (-p/2, ..., p/2] (PARALELIZABLE)
     coeffs_list = plaintext_poly_mod_p.list()
-    centered_coeffs = []
-    limit = p // 2
-    for c in coeffs_list:
-        val = int(c)
-        if val > limit:
-            centered_coeffs.append(val - int(p))
-        else:
-            centered_coeffs.append(val)
 
-    # Reconstrucción sobre ZZ y pasar a Aq
+    if use_parallel:
+        num_cores = multiprocessing.cpu_count()
+        chunk_size = int(gmpy2.ceil(len(coeffs_list) / num_cores))
+        
+        # Dividir la lista de coeficientes en trozos
+        chunks = [coeffs_list[i:i + chunk_size] 
+                  for i in range(0, len(coeffs_list), chunk_size)]
+
+        with multiprocessing.Pool(processes=num_cores) as pool:
+            # pool.starmap aplica center_worker a cada trozo (chunk)
+            # Pasamos p a cada worker
+            results = pool.starmap(center_worker, [(chunk, p) for chunk in chunks])
+
+        # Aplanar la lista de resultados de los chunks
+        centered_coeffs = [item for sublist in results for item in sublist]
+    else:
+        # Versión secuencial de centrado (para referencia)
+        centered_coeffs = []
+        limit = p // 2
+        p_int = int(p)
+        for c in coeffs_list:
+            val = int(c)
+            if val > limit:
+                centered_coeffs.append(val - p_int)
+            else:
+                centered_coeffs.append(val)
+
+    # 4. Reconstrucción sobre ZZ y pasar a Aq (Sequential)
     R_ZZ = PolynomialRing(ZZ, 'x')
     poly_integers = R_ZZ(centered_coeffs)
-    try:
-        return Aq(poly_integers)
-    except Exception:
-        # si Aq es un anillo cociente, usamos el constructor de la forma Aq(poly)
-        return Aq(poly_integers)
+    
+    return Aq(poly_integers)
 
 # -----------------------------
 # FUNCIÓN AUXILIAR DE CENTRADO MODULAR
@@ -80,11 +118,9 @@ def center_mod_q(poly_Aq):
     limit = q // 2
     
     # 1. Obtenemos los coeficientes como lista de enteros [0, q-1]
-    # Si poly_Aq es un elemento de un cociente (ej. Aq), usamos lift()
     try:
         coeffs_raw = poly_Aq.lift().list()
     except Exception:
-        # Si ya es un polinomio simple (ej. en Rq), usamos list()
         coeffs_raw = poly_Aq.list()
 
     # 2. Aplicamos el centrado

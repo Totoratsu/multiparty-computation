@@ -30,8 +30,11 @@ def parameters_worker(m, p, k, s):
     except ArithmeticError:
         return None
 
+    # Esto garantiza que Phi_m mod p se rompa en factores lineales (p ≡ 1 (mod m)).
+    if d != 1:
+        return None
+
     # 4. Verificaciones aritméticas (sin polinomios aún)
-    
     # Condición A: El grado d debe contener a la extensión k (d debe ser múltiplo de k)
     if d % k != 0:
         return None
@@ -41,14 +44,6 @@ def parameters_worker(m, p, k, s):
     num_slots = phi_m // d
     if num_slots < s:
         return None
-
-    # factors = unique_prime_factors(m)
-    # if len(factors) == 1:
-    #     C_m = 4/np.pi
-    # elif np.prod(factors) <= 600:
-    #     C_m = 8.6
-    # else:
-    #     return None
 
     # --- SI LLEGAMOS AQUÍ, EL M ES CORRECTO ---
     # Recién ahora gastamos recursos en construir el objeto pesado para devolverlo.
@@ -144,8 +139,3 @@ def sample_discrete_gaussian_ZN(N, s, q, rng, num_samples=1):
     samples_cont = rng.normal(loc=0.0, scale=sigma, size=(num_samples, N))
     samples_rounded = np.rint(samples_cont).astype(np.int64)
     return np.mod(samples_rounded, q)
-
-def get_Drhod(d):
-    Drhod = []
-    for _ in range(d):
-        Drhod.append()
