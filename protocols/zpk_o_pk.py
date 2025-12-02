@@ -66,7 +66,7 @@ def default_compare_ciphertexts(c1, c2):
 # -------------------------------
 # Prover: Fiat-Shamir non-interactive (usa numpy)
 # -------------------------------
-def zk_pok_prover_fiat_shamir_numpy(pk,
+def zk_pok_prover_fiat_shamir(pk,
                                     ciphertexts_c,      # list length = sec of c_k
                                     witness_xr,         # list length = sec of (x_k, r_k)
                                     sample_random_plaintext, # callable -> random plaintext (in message-space)

@@ -1,119 +1,92 @@
+import gmpy2
 import numpy as np
-from functools import partial
-from sage.all import Zmod, PolynomialRing, ZZ
-from multiprocessing import Pool, cpu_count
-from preprocessing.monte_carlo_C_m import unique_prime_factors
+from sage.all import Zmod, PolynomialRing, ZZ, GF
+
+from .A_q_space import calculate_m, generate_Aq
+from .monte_carlo_C_m import calculate_Cm_parallel, unique_prime_factors
+from .fixed_point_params import fixed_point_qr
 
 
 ################################################################
-#                        Aq Generation                         #
+#                    ParamGen(1^k, M)                          #
 ################################################################
 
-def parameters_worker(m, p, k, s):
-    from sage.all import euler_phi, gcd, Zmod, cyclotomic_polynomial, PolynomialRing
+def ParamGen(p, k, s, n, sec):
+    # General parameters
+    tau = p/2
+    delta = 1.0052
 
-    # 1. Filtro rápido de GCD
-    if gcd(m, p) != 1:
-        return None
+    # Generate m, phi_m
+    min_m = 14620
+    max_m = 50000  # rango de búsqueda de índices ciclotómicos m
+    m, phi_m, coeffs = calculate_m(p, k, s, min_m, max_m)
+    N = phi_m
 
-    # 2. Filtro rápido de phi(m)
-    # Calculamos phi primero porque es barato y descarta muchos candidatos
-    phi_m = int(euler_phi(m))
-    if phi_m < 14300:
-        return None
-
-    # 3. EL GRAN CAMBIO: Calcular el orden multiplicativo
-    # Esto reemplaza a la factorización polinómica. Es O(log m) vs O(poly_degree).
-    try:
-        Zn = Zmod(m)
-        d = int(Zn(p).multiplicative_order())
-    except ArithmeticError:
-        return None
-
-    # Esto garantiza que Phi_m mod p se rompa en factores lineales (p ≡ 1 (mod m)).
-    if d != 1:
-        return None
-
-    # 4. Verificaciones aritméticas (sin polinomios aún)
-    # Condición A: El grado d debe contener a la extensión k (d debe ser múltiplo de k)
-    if d % k != 0:
-        return None
-        
-    # Condición B: Debe haber suficientes slots
-    # El número de factores es phi(m) / d
-    num_slots = phi_m // d
-    if num_slots < s:
-        return None
-
-    # --- SI LLEGAMOS AQUÍ, EL M ES CORRECTO ---
-    # Recién ahora gastamos recursos en construir el objeto pesado para devolverlo.
+    c_sec = 9 * np.power(float(N), 2) * np.power(float(sec), 4) * np.power(2.0, sec + 8)
     
-    Phi_ZZ = cyclotomic_polynomial(m)
-    R = PolynomialRing(Zmod(p), 'x')
-    Phi = R(Phi_ZZ)
+    # Generate G_m
+    factors = unique_prime_factors(m)
+    if len(factors) == 1:
+        C_m = 4/np.pi
+        print("m es primo, asi que C_m =", C_m)
+    elif np.prod(factors) <= 400:
+        C_m = 8.6
+        print("los factores de m son pequeños, entonces C_m =", C_m)
+    else:
+        # Ejecutar en paralelo (aumenta trials para mayor precisión)
+        C_m = float(calculate_Cm_parallel(m, total_trials=1000))
+
+        print(f"\nResultado Monte Carlo Paralelo:")
+        print(f"C_m estimado: {C_m:.2f}")
+
+        # Margen de seguridad (x1.5 o x2 es común en la práctica)
+        margin = 1
+        cm_seguro = C_m * margin
+
+        print(f"Valor recomendado (con margen x{margin}): {cm_seguro:.2f}")
+
+    # Generate q, r
+    r_seed = 3.2 
+
+    # Ejecutar el método numérico
+    q, r = fixed_point_qr(r_seed, N, C_m, p, tau, c_sec, n, sec, delta)
+
+    print("\n=============================================")
+    print("      RESULTADOS DE PARÁMETROS OPTIMIZADOS")
+    print("=============================================")
+    print(f"1. Módulo (q)        : {int(q):.4e}")
+    print(f"   En potencias de 2 : 2^{gmpy2.log2(q):.2f}")
+    print("---------------------------------------------")
+    print(f"2. Ruido std (r/rho) : {r:.6f}")
+    print(f"   (Debe ser >= 3.2) : {'CUMPLE' if r >= 3.2 else 'FALLA'}")
+    print("=============================================")
     
-    # Ni siquiera necesitamos factorizar 'Phi' realmente para devolver la info,
-    # porque ya sabemos que hay 'num_slots' factores de grado 'd'.
-    # Pero si tu código posterior necesita los factores explícitos serializados:
-    fac = Phi.factor()
+    Aq = generate_Aq(q, coeffs)
     
-    # Reconstruimos outputs para compatibilidad con tu código original
-    coeffs = [int(c) for c in Phi.list()]
-    fac_serial = [(str(f), int(e)) for (f, e) in fac]
-    degrees = [d] * num_slots # Todos tienen el mismo grado d
+    return Aq, tau, delta, m, N, coeffs, C_m, q, r
 
-    return (m, coeffs, fac_serial, degrees, phi_m)
+################################################################
+#                           KeyGen                             #
+################################################################
 
-def calculate_m(p, k, s, min_m, max_m):
-    # Preconfiguramos el worker para que reciba sólo m
-    worker_partial = partial(parameters_worker, p=p, k=k, s=s)
+def KeyGen(Aq, N, r, q, rng, p):
+    # Key Generation
+    a = Aq.random_element()
+    s_coeff, e_coeff= sample_discrete_gaussian_ZN(N, r, q, rng, num_samples=2)
+    sk = Aq(s_coeff.tolist())
+    e = Aq(e_coeff.tolist())
+    b = (a*sk) + (p*e)
 
-    found = None
-    pool = Pool(processes=cpu_count())
-    try:
-        # Recorremos los valores de m en paralelo.
-        # Mat. hablando: probamos distintos índices ciclotómicos
-        # buscando uno cuya reducción mod p produzca los grados deseados.
-        for res in pool.imap_unordered(worker_partial, range(min_m, max_m + 1), chunksize=16):
-            if res is not None:
-                found = res
-                break
-    finally:
-        pool.terminate()
-        pool.join()
+    pk = (a, b)
+    # sk
 
-    if not found:
-        print("No encontrado en rango; aumenta max_m o relaja condiciones.")
-        return None
+    # Key hat Generation
+    a_hat = Aq.random_element()
+    b_hat = Aq.random_element()
 
-    m, coeffs, fac_serial, degrees, phi_m = found
-
-    print("m =", m, "phi(m) =", phi_m, "degrees:", degrees)
-    print("coeff:", coeffs)
+    pk_hat = (a_hat, b_hat)
     
-    return m, phi_m, coeffs
-
-def generate_Aq(q, coeffs):
-# 1. Definir el anillo base Z_q (enteros modulo q)
-    # q suele ser una potencia de 2 (ej. 2^64 o 2^128)
-    R_q = Zmod(q)
-    
-    # 2. Definir el anillo de polinomios sobre Z_q
-    PolyRing_q = PolynomialRing(R_q, 'x')
-    
-    # 3. Reconstruir el polinomio ciclotómico Phi_m usando los coeficientes
-    # Los coeficientes vienen de Phi_m calculado en Z (o modulo p), 
-    # pero aquí los interpretamos como elementos de Z_q.
-    Phi = PolyRing_q(coeffs)
-
-    # 4. Construir el anillo cociente A_q = Z_q[x] / (Phi_m)
-    # Este es el espacio donde viven los textos cifrados.
-    Aq = PolyRing_q.quotient(Phi, 'a')
-    
-    print(f"Construido A_q = {Aq}")
-    
-    return Aq
-
+    return pk, sk, pk_hat
 
 ################################################################
 #                    D_{\rho}^d  distribution                  #
@@ -139,3 +112,15 @@ def sample_discrete_gaussian_ZN(N, s, q, rng, num_samples=1):
     samples_cont = rng.normal(loc=0.0, scale=sigma, size=(num_samples, N))
     samples_rounded = np.rint(samples_cont).astype(np.int64)
     return np.mod(samples_rounded, q)
+
+################################################################
+#                       F_{p^k}  distribution                  #
+################################################################
+
+def sample_Fpk(p, k, n):
+    # 1. Creamos el campo finito
+    F = GF(p**k, 'a') 
+    
+    # 2. Generamos n elementos aleatorios
+    # Usamos .vector() para convertir el polinomio (a^2+1) en lista [1, 0, 1...]
+    return [F.random_element() for _ in range(n)]
